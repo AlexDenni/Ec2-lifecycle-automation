@@ -10,7 +10,7 @@ stages:
 - stage: build_publish_stage
   displayName: 'Build & Publish Stage'
   variables:
-    MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+    MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository1
     MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
 
   jobs:
