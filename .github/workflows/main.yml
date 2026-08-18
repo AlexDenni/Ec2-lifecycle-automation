@@ -1,0 +1,215 @@
+pool:
+  vmImage: 'ubuntu-24.04'
+  name: Azure Pipelines
+
+variables:
+  app_version: '1.0'
+  AWS_REGION: 'ap-southeast-1'
+
+stages:
+- stage: build_publish_stage
+  displayName: 'Build & Publish Stage'
+  variables:
+    MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+    MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+  jobs:
+  - job: Build_Publish_MVN_docker
+    displayName: 'Build and Publish for MVN and Docker'
+
+    steps:
+
+    - task: Cache@2
+      inputs:
+        key: 'maven | "$(Agent.OS)" | pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+        path: $(MAVEN_CACHE_FOLDER)
+      displayName: Cache Maven local repo   
+
+    - task: SonarQubePrepare@4
+      inputs:
+        SonarQube: 'azure-devops-sonar'
+        scannerMode: 'Other'
+        extraProperties: |
+          # Additional properties that will be passed to the scanner, 
+          # Put one key=value per line, example:
+          # sonar.exclusions=**/*.bin
+          sonar.projectName=sonata-gateway
+          sonar.projectKey=sonata-gateway
+    
+
+
+
+    - task: JavaToolInstaller@0
+      displayName: 'Install JDK 21'
+      inputs:
+        versionSpec: '21'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'pom.xml'
+        options: '-Dmaven.test.skip=true'
+        publishJUnitResults: false
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.21'
+        mavenOptions: '-Xmx1024m $(MAVEN_OPTS)' 
+        mavenVersionOption: 'Default'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: true
+        sqMavenPluginVersionChoice: 'latest'
+    
+    - task: SonarQubePublish@4
+      inputs:
+        pollingTimeoutSec: '300'
+
+    - task: Docker@2
+      inputs:
+        repository: 'gateway-docker'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: 'latest'
+
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'aws_ecr_registry'
+        regionName: '$(AWS_REGION)'
+        imageSource: 'imagename'
+        sourceImageName: 'gateway-docker'
+        repositoryName: '$(Build.Repository.Name)'
+        pushTag: '$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)'
+
+    - script: |
+        # Debugging: Output the path to the Docker Compose file
+        echo "Docker Compose file path: $(Build.SourcesDirectory)/docker-compose.yml"
+        # Debugging: Output the contents of the Docker Compose file before replacement
+        cat $(Build.SourcesDirectory)/docker-compose.yml
+
+        # Get the dynamically generated image tag from the pipeline variables
+        imageTag="$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)"
+        # Debugging: Output the generated image tag
+        echo "Generated image tag: $imageTag"
+
+        # Replace the image name in the Docker Compose file
+        sed -i "s|image:.*|image: 138075103934.dkr.ecr.ap-southeast-1.amazonaws.com/sonata_gateway:$imageTag|" $(Build.SourcesDirectory)/docker-compose.yml
+        # Debugging: Output the contents of the Docker Compose file after replacement
+        cat $(Build.SourcesDirectory)/docker-compose.yml
+      displayName: 'Update Docker Compose File and Debug'
+
+
+    
+    - task: Bash@3
+      displayName: 'Install Grype and jq'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Install jq
+          sudo apt-get update && sudo apt-get install -y jq
+
+    # Step 2: Run Grype to scan Docker image and save results in JSON format
+    - task: Bash@3
+      displayName: 'Scan Docker Image with Grype'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Run Grype and output in JSON format
+          grype gateway-docker:latest -o json > grype-report.json
+
+    # Step 3: Generate custom graphical HTML report
+    - task: Bash@3
+      displayName: 'Generate Custom Graphical HTML Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Create HTML header with CSS for styling
+          echo "<!DOCTYPE html>" > grype-report.html
+          echo "<html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">" >> grype-report.html
+          echo "<title>Grype Scan Report</title><style>body { font-family: Arial, sans-serif; } .high { color: red; } .medium { color: orange; } .low { color: green; }</style></head><body>" >> grype-report.html
+          echo "<h1>Grype Vulnerability Scan Report</h1>" >> grype-report.html
+          echo "<table border=\"1\"><tr><th>Package</th><th>Vulnerability</th><th>Severity</th><th>Installed Version</th><th>Fixed Version</th></tr>" >> grype-report.html
+
+          # Use jq to populate HTML table rows
+          jq -r '.matches[] | "<tr><td>" + (.artifact.name // "N/A") + "</td><td>" + (.vulnerability.id // "N/A") + "</td><td class=\"" + (.vulnerability.severity | ascii_downcase) + "\">" + (.vulnerability.severity // "N/A") + "</td><td>" + (.artifact.version // "N/A") + "</td><td>" + (.vulnerability.fixed_in_version // "N/A") + "</td></tr>"' grype-report.json >> grype-report.html
+          
+          # Close HTML tags
+          echo "</table></body></html>" >> grype-report.html
+
+    # Step 4: Publish the graphical HTML report as an artifact
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Graphical HTML Report'
+      inputs:
+        targetPath: 'grype-report.html'
+        artifact: 'GraphicalGrypeReport'
+        publishLocation: 'pipeline'
+
+    - task: publishhtmlreport@1
+      inputs:
+        htmlType: 'genericHTML'
+        htmlPath: '$(Build.SourcesDirectory)/grype-report.html'
+      displayName: 'Publish Report as HTML'
+
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/docker-compose.yml'
+        artifact: 'edited-docker-compose-file'
+
+- stage: deploy_stage
+  displayName: 'Deploy Stage'
+  dependsOn: build_publish_stage
+
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy using SSH and Docker Compose'
+    pool:
+      name: Sonata Agent Local
+
+    steps:
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifactName: 'edited-docker-compose-file' 
+        targetPath: '/home/localdocker/azure_sonata_dev/sonata_gateway'
+      displayName: 'Download Docker Compose File Artifact'
+
+    - task: SSH@0
+      inputs:
+        sshEndpoint: 'sonata_local_dev'
+        runOptions: 'inline'
+        inline: | 
+          # Move the existing Docker Compose file to the backup directory with a timestamp-based name
+          mv /home/devsonat/azure_migration/sonata_gateway/*.yml /home/devsonat/azure_migration/sonata_gateway/previous_version_compose_files/
+          # List the YAML files in the backup directory by modification time, oldest first
+          ls -t /home/devsonat/azure_migration/sonata_gateway/previous_version_compose_files/*.yml | tail -n +6 | xargs -I {} rm {}
+          # Remove unused Docker containers and images to free up disk space
+          #docker image prune -af
+      displayName: 'Clean Up'
+
+    - task: CopyFilesOverSSH@0
+      inputs:
+        sshEndpoint: 'sonata_local_dev'
+        sourceFolder: '/home/localdocker/azure_sonata_dev/sonata_gateway'
+        contents: 'docker-compose.yml'
+        targetFolder: '/home/devsonat/azure_migration/sonata_gateway'
+        readyTimeout: '20000'
+
+    - task: SSH@0
+      inputs:
+        sshEndpoint: 'sonata_local_dev'
+        runOptions: 'inline'
+        inline: | 
+          # Set RELEASE_VERSION variable
+          export RELEASE_VERSION=$(Build.BuildId)
+              
+          # Move the existing Docker Compose file to a backup directory with a timestamp-based name
+          mv /home/devsonat/azure_migration/sonata_gateway/docker-compose.yml /home/devsonat/azure_migration/sonata_gateway/docker-compose-$RELEASE_VERSION.yml
+
+          #Run Deployment
+          docker-compose -f /home/devsonat/azure_migration/sonata_gateway/docker-compose-$RELEASE_VERSION.yml up -d
+        failOnStdErr: false         
+      displayName: 'ECR Configuration and Run Deployment'
